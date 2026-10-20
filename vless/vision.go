@@ -9,6 +9,7 @@ import (
 	"net"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -36,13 +37,14 @@ const xrayChunkSize = 8192
 
 type VisionConn struct {
 	net.Conn
-	reader      *bufio.ChunkReader
-	writer      N.VectorisedWriter
-	writeAccess sync.Mutex
-	input       *bytes.Reader
-	rawInput    *bytes.Buffer
-	netConn     net.Conn
-	logger      logger.Logger
+	reader                *bufio.ChunkReader
+	writer                N.VectorisedWriter
+	writeAccess           sync.Mutex
+	closeRawOnDirectWrite atomic.Bool
+	input                 *bytes.Reader
+	rawInput              *bytes.Buffer
+	netConn               net.Conn
+	logger                logger.Logger
 
 	userUUID               [16]byte
 	isTLS                  bool
@@ -78,8 +80,15 @@ func NewVisionConn(conn net.Conn, tlsConn net.Conn, userUUID [16]byte, logger lo
 	if !loaded {
 		return nil, E.New("vision: not a valid supported TLS connection: ", reflect.TypeOf(tlsConn))
 	}
-	input, _ := reflectType.FieldByName("input")
-	rawInput, _ := reflectType.FieldByName("rawInput")
+	if reflectPointer == nil || reflectType == nil || reflectType.Kind() != reflect.Struct {
+		return nil, E.New("vision: invalid TLS connection pointer or type")
+	}
+	input, inputOK := reflectType.FieldByName("input")
+	rawInput, rawInputOK := reflectType.FieldByName("rawInput")
+	if !inputOK || !rawInputOK || input.Type != reflect.TypeOf(bytes.Reader{}) || rawInput.Type != reflect.TypeOf(bytes.Buffer{}) ||
+		input.Offset+input.Type.Size() > reflectType.Size() || rawInput.Offset+rawInput.Type.Size() > reflectType.Size() {
+		return nil, E.New("vision: unsupported TLS buffer layout")
+	}
 	return &VisionConn{
 		Conn:     conn,
 		reader:   bufio.NewChunkReader(conn, xrayChunkSize),
@@ -203,6 +212,7 @@ func (c *VisionConn) Write(p []byte) (n int, err error) {
 			if c.isTLS && buffer.Len() > 6 && bytes.Equal(tlsApplicationDataStart, buffer.To(3)) {
 				var command byte = commandPaddingEnd
 				if c.enableXTLS {
+					c.closeRawOnDirectWrite.Store(true)
 					c.directWrite = true
 					specIndex = i
 					command = commandPaddingDirect
@@ -386,4 +396,29 @@ func (c *VisionConn) NeedAdditionalReadDeadline() bool {
 
 func (c *VisionConn) Upstream() any {
 	return c.Conn
+}
+
+// Direct Vision records share the raw stream with the inner TLS connection.
+// Once direct writing starts, outer TLS alerts must not be added to that stream.
+func (c *VisionConn) Close() error {
+	if c.closeRawOnDirectWrite.Load() {
+		return c.netConn.Close()
+	}
+	return c.Conn.Close()
+}
+
+func (c *VisionConn) CloseWrite() error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
+	if c.directWrite {
+		if duplex, loaded := c.netConn.(N.WriteCloser); loaded {
+			return duplex.CloseWrite()
+		}
+		// A direct transport without half-close still closes the raw stream.
+		return c.Close()
+	}
+	if graceful, loaded := c.Conn.(N.WriteCloser); loaded {
+		return graceful.CloseWrite()
+	}
+	return c.Close()
 }

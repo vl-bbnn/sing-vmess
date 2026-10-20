@@ -3,8 +3,10 @@ package vless
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"io"
 	"net"
+	"sync"
 
 	"github.com/sagernet/sing-vmess"
 	"github.com/sagernet/sing/common/auth"
@@ -105,6 +107,7 @@ func flowName(value string) string {
 
 type serverConn struct {
 	N.ExtendedConn
+	writeAccess     sync.Mutex
 	responseWritten bool
 }
 
@@ -113,6 +116,8 @@ func (c *serverConn) Read(b []byte) (n int, err error) {
 }
 
 func (c *serverConn) Write(b []byte) (n int, err error) {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if !c.responseWritten {
 		buffer := buf.NewSize(2 + len(b))
 		buffer.WriteByte(Version)
@@ -130,6 +135,8 @@ func (c *serverConn) Write(b []byte) (n int, err error) {
 }
 
 func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if !c.responseWritten {
 		header := buffer.ExtendHeader(2)
 		header[0] = Version
@@ -140,6 +147,8 @@ func (c *serverConn) WriteBuffer(buffer *buf.Buffer) error {
 }
 
 func (c *serverConn) FrontHeadroom() int {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	if c.responseWritten {
 		return 0
 	}
@@ -151,6 +160,8 @@ func (c *serverConn) ReaderReplaceable() bool {
 }
 
 func (c *serverConn) WriterReplaceable() bool {
+	c.writeAccess.Lock()
+	defer c.writeAccess.Unlock()
 	return c.responseWritten
 }
 
@@ -244,4 +255,12 @@ func (c *serverPacketConn) NeedAdditionalReadDeadline() bool {
 
 func (c *serverPacketConn) Upstream() any {
 	return c.ExtendedConn
+}
+
+// A graceful response EOF carries the VLESS response header, including empty responses.
+// Keep the existing full-close fallback; abort Close does not emit a response header.
+func (c *serverConn) CloseWrite() error {
+	_, writeErr := c.Write(nil)
+	closeErr := c.ExtendedConn.Close()
+	return errors.Join(writeErr, closeErr)
 }
